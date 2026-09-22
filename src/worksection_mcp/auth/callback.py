@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import socket
 import ssl
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -208,7 +209,15 @@ class CallbackServer:
         # Configure handler with callback
         CallbackHandler.callback_received = self._handle_callback
 
-        self._server = HTTPServer((self.host, self.port), CallbackHandler)
+        server_cls = HTTPServer
+        if ":" in self.host:
+
+            class _HTTPServerV6(HTTPServer):
+                address_family = socket.AF_INET6
+
+            server_cls = _HTTPServerV6
+
+        self._server = server_cls((self.host, self.port), CallbackHandler)
 
         # Wrap socket with SSL if context provided
         if self.ssl_context:

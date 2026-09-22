@@ -19,10 +19,10 @@ and process image attachments.
 > [pbv7/worksection-mcp](https://github.com/pbv7/worksection-mcp) that adds
 > **opt-in write operations** on top of the upstream read-only server:
 > `add_comment`, `create_task`, `update_task`, `complete_task`, `reopen_task`,
-> and `set_task_status`. Writes are **disabled by default** — they require
-> `WORKSECTION_ENABLE_WRITES=true` **and** an OAuth token authorized with the
-> relevant `*_write` scopes (`tasks_write`, `comments_write`, and `tags_write`
-> for status labels). With the flag off, behavior is identical to upstream.
+> `set_task_status` and `log_time`. Writes are **disabled by default** — they
+> require `WORKSECTION_ENABLE_WRITES=true` **and** an OAuth token authorized
+> with the relevant `*_write` scopes (`tasks_write`, `comments_write`,
+> `tags_write` for status labels, `costs_write` for logged time). With the flag off, behavior is identical to upstream.
 > See [Write Operations](#write-operations-opt-in).
 
 ## Features
@@ -321,12 +321,13 @@ audit line to the logs.
 | `complete_task` | Mark a task done | `tasks_write` |
 | `reopen_task` | Reopen a completed task | `tasks_write` |
 | `set_task_status` | Add/remove status or label tags on a task | `tags_write` |
+| `log_time` | Log time against a task, optionally on an earlier date | `costs_write` |
 
 ### Enabling writes
 
 1. Add the write scopes you need to your Worksection OAuth2 app (in Worksection
    admin), e.g. `tasks_write`, `comments_write` (+ `tags_write` for
-   `set_task_status`).
+   `set_task_status`, `costs_write` for `log_time`).
 2. Add those scopes to `WORKSECTION_SCOPES` in `.env` and set
    `WORKSECTION_ENABLE_WRITES=true`.
 3. Re-authenticate so the new token carries the write scopes (delete

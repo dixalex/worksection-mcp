@@ -1,13 +1,13 @@
 """Write (mutation) MCP tools for Worksection.
 
 DISABLED BY DEFAULT. Every tool in this module modifies live Worksection data
-(creates/edits tasks, posts comments, changes task status). They refuse to run
+(creates/edits tasks, posts comments, changes task status, logs time). They refuse to run
 unless BOTH of these are true:
 
 1. ``WORKSECTION_ENABLE_WRITES=true`` in the environment, and
 2. the OAuth token was authorized with the relevant ``*_write`` scope
    (``tasks_write`` for tasks/status, ``comments_write`` for comments,
-   ``tags_write`` for status-label changes).
+   ``tags_write`` for status-label changes, ``costs_write`` for logged time).
 
 The enable flag is the local kill-switch; the token scope is enforced by the
 Worksection API itself. Both layers must agree before anything is written.
@@ -29,7 +29,7 @@ _WRITES_DISABLED = {
     "message": (
         "Worksection write operations are disabled. Set WORKSECTION_ENABLE_WRITES=true "
         "and re-authenticate with the required *_write scopes (tasks_write, "
-        "comments_write, tags_write) to enable."
+        "comments_write, tags_write, costs_write) to enable."
     ),
 }
 
@@ -80,6 +80,36 @@ def register_write_tools(
             hidden=hidden_emails,
             mention=mention_emails,
         )
+
+    @mcp.tool()
+    async def log_time(
+        task_id: str,
+        time: str,
+        comment: str | None = None,
+        date: str | None = None,
+    ) -> dict:
+        """Log time spent on a task. WRITE — creates a cost entry on live data.
+
+        Requires WORKSECTION_ENABLE_WRITES=true and the costs_write scope.
+        The entry is attributed to the account that owns the OAuth token.
+        Without a date the entry lands on today.
+
+        Args:
+            task_id: The task ID to log time against
+            time: Time spent, one of "0.15" (decimal hours), "0,15" or "0:09" (h:mm)
+            comment: Optional note describing what the time went on
+            date: Optional day the time belongs to, as YYYY-MM-DD
+
+        Returns:
+            API response with the created cost id, or a writes_disabled error envelope
+        """
+        blocked = _blocked()
+        if blocked:
+            return blocked
+        if not time or not time.strip():
+            raise ValueError("time must be a non-empty string")
+        logger.info("WRITE log_time id_task=%s time=%s date=%s", task_id, time, date)
+        return await client.add_costs(task_id=task_id, time=time, comment=comment, date=date)
 
     @mcp.tool()
     async def create_task(

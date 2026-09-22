@@ -53,6 +53,7 @@ def build_settings(temp_dir: Path, **overrides: Any) -> Settings:
         "worksection_redirect_uri": "https://localhost:8080/oauth/callback",
         "worksection_scopes": "projects_read,tasks_read,costs_read,tags_read,comments_read,files_read,users_read,contacts_read",
         "oauth_callback_use_ssl": True,
+        "oauth_interactive_fallback": True,
         "token_storage_path": temp_dir / "tokens",
         "file_cache_path": temp_dir / "files",
         "oauth_ssl_cert_path": temp_dir / "certs" / "callback.crt",

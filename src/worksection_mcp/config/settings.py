@@ -66,6 +66,14 @@ class Settings(BaseSettings):
         default=True,
         description="Automatically open browser for OAuth authorization",
     )
+    oauth_interactive_fallback: bool = Field(
+        default=True,
+        description=(
+            "Fall back to the interactive browser flow when no usable token is stored. "
+            "Disable when the registered redirect URI is not a local callback, so startup "
+            "fails fast instead of blocking on a flow that cannot complete."
+        ),
+    )
 
     # SSL Configuration for OAuth Callback
     oauth_callback_use_ssl: bool = Field(

@@ -788,6 +788,39 @@ class WorksectionClient:
     # thin: validation and gating live in tools/writes.py.
     # ==========================================================================
 
+    async def add_costs(
+        self,
+        task_id: str,
+        time: str | None = None,
+        money: str | None = None,
+        comment: str | None = None,
+        date: str | None = None,
+    ) -> dict[str, Any]:
+        """Log time and/or money against a task (requires costs_write scope).
+
+        Args:
+            task_id: Task ID the cost belongs to
+            time: Time in Worksection format, one of "0.15", "0,15" or "0:09"
+            money: Money amount, when logging a monetary cost
+            comment: Optional note describing the work
+            date: Optional date the cost belongs to, as YYYY-MM-DD
+
+        Returns:
+            API response carrying the created cost id
+        """
+        if not time and not money:
+            raise ValueError("at least one of time or money is required")
+        params: dict[str, Any] = {"id_task": task_id}
+        if time:
+            params["time"] = time
+        if money:
+            params["money"] = money
+        if comment:
+            params["comment"] = comment
+        if date:
+            params["date"] = date
+        return await self._make_request("add_costs", params, method="POST")
+
     async def post_comment(
         self,
         task_id: str,

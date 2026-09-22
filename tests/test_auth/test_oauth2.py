@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -140,8 +141,8 @@ async def test_ensure_authenticated_refreshes_when_possible(oauth_manager):
 
 
 @pytest.mark.asyncio
-async def test_ensure_authenticated_falls_back_to_full_auth(oauth_manager):
-    """Failed refresh should clear tokens and run full interactive auth."""
+async def test_ensure_authenticated_keeps_tokens_when_refresh_fails(oauth_manager):
+    """Failed refresh must not discard stored tokens before falling back."""
     oauth_manager.token_storage = SimpleNamespace(
         is_access_token_valid=MagicMock(return_value=False),
         get_refresh_token=MagicMock(return_value="refresh"),
@@ -152,8 +153,94 @@ async def test_ensure_authenticated_falls_back_to_full_auth(oauth_manager):
 
     await oauth_manager.ensure_authenticated()
 
-    oauth_manager.token_storage.delete.assert_called_once()
+    oauth_manager.token_storage.delete.assert_not_called()
     oauth_manager.authenticate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_authenticated_uses_token_refreshed_by_another_process(oauth_manager):
+    """A token refreshed while waiting for the lock should be reused as is."""
+    validity = iter([False, True])
+    oauth_manager.token_storage = SimpleNamespace(
+        is_access_token_valid=MagicMock(side_effect=lambda: next(validity)),
+        get_refresh_token=MagicMock(return_value="refresh"),
+        save=MagicMock(),
+        delete=MagicMock(),
+    )
+    oauth_manager._refresh_token = AsyncMock()
+    oauth_manager.authenticate = AsyncMock()
+
+    await oauth_manager.ensure_authenticated()
+
+    oauth_manager._refresh_token.assert_not_called()
+    oauth_manager.authenticate.assert_not_called()
+    oauth_manager.token_storage.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_authenticated_raises_when_interactive_fallback_disabled(oauth_manager):
+    """With the browser flow disabled the failure must be explicit."""
+    oauth_manager.settings.oauth_interactive_fallback = False
+    oauth_manager.token_storage = SimpleNamespace(
+        is_access_token_valid=MagicMock(return_value=False),
+        get_refresh_token=MagicMock(return_value="refresh"),
+        delete=MagicMock(),
+    )
+    oauth_manager._refresh_token = AsyncMock(side_effect=OAuth2Error("refresh failed"))
+    oauth_manager.authenticate = AsyncMock()
+
+    with pytest.raises(OAuth2Error, match="OAUTH_INTERACTIVE_FALLBACK"):
+        await oauth_manager.ensure_authenticated()
+
+    oauth_manager.authenticate.assert_not_called()
+    oauth_manager.token_storage.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_lock_is_skipped_without_file_locking(tmp_path, monkeypatch):
+    """Where flock is unavailable the refresh runs unserialised, not broken."""
+    monkeypatch.setattr("worksection_mcp.auth.oauth2.fcntl", None)
+    mgr = OAuth2Manager(build_settings(tmp_path))
+
+    handle = await mgr._acquire_refresh_lock()
+
+    assert handle is None
+    await mgr._release_refresh_lock(handle)
+
+
+@pytest.mark.asyncio
+async def test_refresh_lock_is_exclusive_across_managers(tmp_path):
+    """A second holder must block until the first one releases the lock."""
+    first = OAuth2Manager(build_settings(tmp_path))
+    second = OAuth2Manager(build_settings(tmp_path))
+
+    held = await first._acquire_refresh_lock()
+    try:
+        with pytest.raises(OAuth2Error, match="Timed out waiting"):
+            await second._acquire_refresh_lock(wait_seconds=0.3)
+    finally:
+        await first._release_refresh_lock(held)
+
+    acquired = await asyncio.wait_for(second._acquire_refresh_lock(), timeout=5)
+    await second._release_refresh_lock(acquired)
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_surfaces_worksection_error_description(oauth_manager):
+    """Worksection reports refresh errors as HTTP 200 plus errorDescription."""
+    oauth_manager.token_storage = SimpleNamespace(
+        get_refresh_token=MagicMock(return_value="refresh"),
+    )
+    http_client = AsyncMock()
+    http_client.post = AsyncMock(
+        return_value=httpx.Response(
+            200, json={"errorDescription": "Cannot decrypt the refresh token"}
+        )
+    )
+    oauth_manager._get_http_client = AsyncMock(return_value=http_client)  # type: ignore[method-assign]
+
+    with pytest.raises(OAuth2Error, match="Cannot decrypt the refresh token"):
+        await oauth_manager._refresh_token()
 
 
 @pytest.mark.asyncio

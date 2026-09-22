@@ -21,6 +21,7 @@ def _make_write_client(**overrides: Any) -> Any:
         "complete_task": AsyncMock(return_value={"status": "ok"}),
         "reopen_task": AsyncMock(return_value={"status": "ok"}),
         "update_task_tags": AsyncMock(return_value={"status": "ok"}),
+        "add_costs": AsyncMock(return_value={"status": "ok", "id": 3706}),
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -31,7 +32,7 @@ def _settings(enabled: bool) -> Any:
 
 
 def test_write_tools_are_registered() -> None:
-    """All six write tools should be registered."""
+    """Every write tool should be registered."""
     mcp = FakeMCP()
     register_write_tools(mcp, _make_write_client(), _settings(True))
     for name in (
@@ -41,6 +42,7 @@ def test_write_tools_are_registered() -> None:
         "complete_task",
         "reopen_task",
         "set_task_status",
+        "log_time",
     ):
         assert name in mcp.tools
 
@@ -59,6 +61,7 @@ async def test_writes_disabled_refuses_and_never_calls_client() -> None:
         await mcp.tools["complete_task"]("t1"),
         await mcp.tools["reopen_task"]("t1"),
         await mcp.tools["set_task_status"]("t1", add_tags="On Track"),
+        await mcp.tools["log_time"]("t1", "1:30"),
     ]
 
     for r in results:
@@ -71,6 +74,7 @@ async def test_writes_disabled_refuses_and_never_calls_client() -> None:
     client.complete_task.assert_not_awaited()
     client.reopen_task.assert_not_awaited()
     client.update_task_tags.assert_not_awaited()
+    client.add_costs.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -161,3 +165,43 @@ async def test_validation_is_checked_after_the_enable_gate() -> None:
     result = await mcp.tools["create_task"]("p1", "")
     assert result["error"] == "writes_disabled"
     client.post_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_log_time_delegates_to_add_costs() -> None:
+    """Enabled log_time should forward the task and time to the client."""
+    client = _make_write_client()
+    mcp = FakeMCP()
+    register_write_tools(mcp, client, _settings(True))
+
+    result = await mcp.tools["log_time"]("t1", "0:45")
+
+    client.add_costs.assert_awaited_with(task_id="t1", time="0:45", comment=None, date=None)
+    assert result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_log_time_rejects_blank_time() -> None:
+    """A blank time must fail before any client call."""
+    client = _make_write_client()
+    mcp = FakeMCP()
+    register_write_tools(mcp, client, _settings(True))
+
+    with pytest.raises(ValueError, match="time must be a non-empty string"):
+        await mcp.tools["log_time"]("t1", "   ")
+
+    client.add_costs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_log_time_forwards_date_and_comment() -> None:
+    """A backdated entry must pass the day and note through to the client."""
+    client = _make_write_client()
+    mcp = FakeMCP()
+    register_write_tools(mcp, client, _settings(True))
+
+    await mcp.tools["log_time"]("t1", "2:00", comment="webhook review", date="2026-09-21")
+
+    client.add_costs.assert_awaited_with(
+        task_id="t1", time="2:00", comment="webhook review", date="2026-09-21"
+    )

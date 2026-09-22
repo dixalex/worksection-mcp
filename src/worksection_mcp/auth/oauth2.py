@@ -1,12 +1,18 @@
 """OAuth2 authentication manager for Worksection."""
 
+import asyncio
 import logging
 import secrets
 import webbrowser
-from typing import Any, cast
+from typing import IO, Any, cast
 from urllib.parse import urlencode
 
 import httpx
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 from worksection_mcp.auth.callback import CallbackServer
 from worksection_mcp.auth.tokens import TokenStorage
@@ -15,6 +21,17 @@ from worksection_mcp.config import Settings
 logger = logging.getLogger(__name__)
 
 _SENSITIVE_TOKEN_KEYS = {"access_token", "refresh_token"}
+
+_REFRESH_LOCK_FILENAME = "refresh.lock"
+_REFRESH_LOCK_POLL_SECONDS = 0.1
+_REFRESH_LOCK_TIMEOUT_SECONDS = 20.0
+
+
+def _describe_error(payload: dict[str, Any], fallback: str) -> tuple[str, str]:
+    """Extract error code and description, tolerating Worksection's field names."""
+    error = payload.get("error") or payload.get("errorCode") or "invalid_request"
+    description = payload.get("error_description") or payload.get("errorDescription") or fallback
+    return str(error), str(description)
 
 
 class OAuth2Error(Exception):
@@ -45,6 +62,44 @@ class OAuth2Manager:
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(timeout=30.0)
         return self._http_client
+
+    async def _acquire_refresh_lock(
+        self, wait_seconds: float = _REFRESH_LOCK_TIMEOUT_SECONDS
+    ) -> IO[str] | None:
+        """Take an exclusive cross-process lock guarding the refresh.
+
+        Polls instead of blocking, so the wait stays cancellable and bounded.
+        Returns None where file locking is unavailable, leaving the refresh
+        unserialised rather than unusable.
+        """
+        if fcntl is None:
+            return None
+        lock_path = self.settings.token_storage_path / _REFRESH_LOCK_FILENAME
+        await asyncio.to_thread(lock_path.parent.mkdir, parents=True, exist_ok=True)
+        handle = await asyncio.to_thread(lock_path.open, "w")
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except OSError:
+                if asyncio.get_running_loop().time() >= deadline:
+                    handle.close()
+                    raise OAuth2Error("Timed out waiting for the token refresh lock") from None
+                try:
+                    await asyncio.sleep(_REFRESH_LOCK_POLL_SECONDS)
+                except BaseException:
+                    handle.close()
+                    raise
+
+    async def _release_refresh_lock(self, handle: IO[str] | None) -> None:
+        """Release the refresh lock, if one was taken."""
+        if handle is None or fcntl is None:
+            return
+        try:
+            await asyncio.to_thread(fcntl.flock, handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     async def close(self) -> None:
         """Close HTTP client."""
@@ -98,13 +153,17 @@ class OAuth2Manager:
 
         response = await client.post(url, data=data)
 
+        response_data = response.json() if response.content else {}
+
         if response.status_code != 200:
-            error_data = response.json() if response.content else {}
-            error = error_data.get("error", "unknown_error")
-            error_desc = error_data.get("error_description", response.text)
+            error, error_desc = _describe_error(response_data, response.text)
             raise OAuth2Error(f"Token exchange failed: {error} - {error_desc}")
 
-        return cast(dict[str, Any], response.json())
+        if "access_token" not in response_data:
+            error, error_desc = _describe_error(response_data, "No access_token in response")
+            raise OAuth2Error(f"Token exchange failed: {error} - {error_desc}")
+
+        return cast(dict[str, Any], response_data)
 
     async def _refresh_token(self) -> dict[str, Any]:
         """Refresh access token using refresh token.
@@ -135,14 +194,12 @@ class OAuth2Manager:
         response_data = response.json() if response.content else {}
 
         if response.status_code != 200:
-            error = response_data.get("error", "unknown_error")
-            error_desc = response_data.get("error_description", response.text)
+            error, error_desc = _describe_error(response_data, response.text)
             raise OAuth2Error(f"Token refresh failed: {error} - {error_desc}")
 
         # Validate response contains required fields (API may return 200 with error body)
         if "access_token" not in response_data:
-            error = response_data.get("error", "invalid_response")
-            error_desc = response_data.get("error_description", "No access_token in response")
+            error, error_desc = _describe_error(response_data, "No access_token in response")
             safe_data = {
                 k: "[REDACTED]" if k in _SENSITIVE_TOKEN_KEYS else v
                 for k, v in response_data.items()
@@ -238,19 +295,33 @@ class OAuth2Manager:
             logger.debug("Access token is valid")
             return
 
-        # Try to refresh
-        refresh_token = self.token_storage.get_refresh_token()
-        if refresh_token:
-            try:
-                logger.info("Access token expired, attempting refresh...")
-                token_response = await self._refresh_token()
-                self.token_storage.save(token_response)
-                logger.info("Token refreshed successfully")
+        lock = await self._acquire_refresh_lock()
+        try:
+            # Another process may have refreshed while we waited for the lock
+            if self.token_storage.is_access_token_valid():
+                logger.info("Access token was refreshed by another process")
                 return
-            except OAuth2Error as e:
-                logger.warning(f"Token refresh failed: {e}")
-                # Clear invalid tokens
-                self.token_storage.delete()
+
+            if self.token_storage.get_refresh_token():
+                try:
+                    logger.info("Access token expired, attempting refresh...")
+                    token_response = await self._refresh_token()
+                    self.token_storage.save(token_response)
+                    logger.info("Token refreshed successfully")
+                    return
+                except OAuth2Error as e:
+                    # Never delete here: the stored refresh token may still be the
+                    # only usable one, and discarding it forces a manual re-authorization
+                    logger.warning(f"Token refresh failed, stored tokens kept: {e}")
+        finally:
+            await self._release_refresh_lock(lock)
+
+        if not self.settings.oauth_interactive_fallback:
+            raise OAuth2Error(
+                "No usable token and the interactive browser flow is disabled "
+                "(OAUTH_INTERACTIVE_FALLBACK=false). Re-authorize manually and store a "
+                "fresh token."
+            )
 
         # Need full authentication
         logger.info("No valid tokens, starting authentication flow...")
